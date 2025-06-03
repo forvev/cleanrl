@@ -42,11 +42,11 @@ class Args:
     """the learning rate of the optimizer"""
     num_envs: int = 4
     """the number of parallel game environments"""
-    num_steps: int = 128
+    num_steps: int = 128 # it means that for each policy rollout I will collect 4*128 data points for training
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.99
+    gamma: float = 0.99 # just a discount variable
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
@@ -78,6 +78,7 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
+# Since PPO deals with the vector env instead of gym env directly, we need this function
 def make_env(env_id, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
@@ -90,13 +91,13 @@ def make_env(env_id, idx, capture_video, run_name):
 
     return thunk
 
-
+# takes as an argument layer (used by PPO) and two initialization params
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
+    torch.nn.init.orthogonal_(layer.weight, std) # PPO uses orthogonal initialization on layer.weight
+    torch.nn.init.constant_(layer.bias, bias_const) # PPO uses constant initialization on layer.weight
     return layer
 
-
+# interacts with the environments 
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
@@ -119,16 +120,22 @@ class Agent(nn.Module):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
+        logits = self.actor(x) # actor outputs logits which are unnomalized action probabilities
+        # it means that they don't necessarily lie in <0,1> or sum up to 1
+        # that's why we use Categorical which is basically a softmax operation to get the desired probability distribution
         probs = Categorical(logits=logits)
+        # If no action is given, sample one stochastically from the current policy distribution:
         if action is None:
             action = probs.sample()
+        # probs.log_prob(action) is basically log_{pi} (a_t|s_t). it answers: how confident was the policy in taking this action?”
+        # probs.entropy() encourages exploration when high
+        # self.critic(x): still not sure how to explain this TODO
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
 
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    args.batch_size = int(args.num_envs * args.num_steps)
+    args.batch_size = int(args.num_envs * args.num_steps) # 512
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -168,6 +175,7 @@ if __name__ == "__main__":
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
+    # the size of the array depends on the num_steps and num_envs, so in our case we will collect 512 data points
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -176,15 +184,18 @@ if __name__ == "__main__":
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
     # TRY NOT TO MODIFY: start the game
-    global_step = 0
-    start_time = time.time()
+    global_step = 0 # to track the number of env step
+    start_time = time.time() # will help to calculate FPS
     next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = torch.Tensor(next_obs).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
+    next_obs = torch.Tensor(next_obs).to(device) # stores the initial observation
+    next_done = torch.zeros(args.num_envs).to(device) # As the rollout proceeds, this array is updated every step to reflect which environments have completed an episode.
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
+        # Annealing algorithm helps to explore. Or in different words, helps to escape the local optimum.
         if args.anneal_lr:
+            # because of args.num_iterations it will lineary decreace to zero. So at the beginning it will be doing kinda brave escapes,
+            # however it will stop after some steps.
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
