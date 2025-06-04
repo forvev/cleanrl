@@ -263,14 +263,19 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
+                #  Re-computing logprobs and values with the updated policy
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                # we use log for the numerical stability (helpful for really small values)
                 logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
+                ratio = logratio.exp() #why? exp(log(a)-log(b)) = a/b. It can be 1.2, so it means that the new policy is better
 
                 with torch.no_grad():
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
+                    # On average, how surprised is the new policy when seeing actions from the old policy?
+                    # there is a minus because it should be (-newlogprob + b_logprobs[mb_inds]) => old-new
+                    old_approx_kl = (-logratio).mean() # approx_KL: E [-log(pi_new - pi_old)]
                     approx_kl = ((ratio - 1) - logratio).mean()
+                    # tells us how often the policy tried to change too much
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
@@ -284,7 +289,7 @@ if __name__ == "__main__":
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean() # it does the max of negatives, however the paper
                 # does the min of positives, so it's equivalent
 
-                # Value loss
+                # Value loss - to avoid overfitting
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
@@ -303,14 +308,16 @@ if __name__ == "__main__":
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
-                optimizer.zero_grad()
-                loss.backward()
+                # the learning part
+                optimizer.zero_grad() # clear out the gradients
+                loss.backward() # compute gradients
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
+                optimizer.step() # look at these gradients and decide how to update them
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
 
+        # monitor how well the critic is learning
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
