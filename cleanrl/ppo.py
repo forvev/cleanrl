@@ -36,13 +36,14 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "CartPole-v1"
     """the id of the environment"""
-    total_timesteps: int = 500000
+    total_timesteps: int = 500000 # for more complex envs such as atari you would need 1M for example
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
     num_envs: int = 4
     """the number of parallel game environments"""
     num_steps: int = 128 # it means that for each policy rollout I will collect 4*128 data points for training
+    # 128 is big enough to collect some meaningful info and small enough to update frequently
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -80,16 +81,13 @@ class Args:
 
 # Since PPO deals with the vector env instead of gym env directly, we need this function
 def make_env(env_id, idx, capture_video, run_name):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        return env
-
-    return thunk
+    if capture_video and idx == 0:
+        env = gym.make(env_id, render_mode="rgb_array")
+        env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+    else:
+        env = gym.make(env_id)
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+    return env
 
 # takes as an argument layer (used by PPO) and two initialization params
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -101,6 +99,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
+        # critic NN
         self.critic = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
@@ -108,6 +107,7 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
+        # Actor NN
         self.actor = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
@@ -136,8 +136,8 @@ class Agent(nn.Module):
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps) # 512
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
+    args.minibatch_size = int(args.batch_size // args.num_minibatches) # 128
+    args.num_iterations = args.total_timesteps // args.batch_size # 500000 // 512
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -166,6 +166,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
+    # PPO collects data in parallel from multiple envs. Thay's why we use SyncVectorEnv
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
@@ -190,7 +191,7 @@ if __name__ == "__main__":
     next_obs = torch.Tensor(next_obs).to(device) # stores the initial observation
     next_done = torch.zeros(args.num_envs).to(device) # As the rollout proceeds, this array is updated every step to reflect which environments have completed an episode.
 
-    for iteration in range(1, args.num_iterations + 1):
+    for iteration in range(1, args.num_iterations + 1): # == one rollout
         # Annealing the rate if instructed to do so.
         # Annealing algorithm helps to explore. Or in different words, helps to escape the local optimum.
         if args.anneal_lr:
@@ -206,7 +207,7 @@ if __name__ == "__main__":
             dones[step] = next_done
 
             # ALGO LOGIC: action logic
-            with torch.no_grad():
+            with torch.no_grad(): # we just collect the data, we don't train - saves the memory
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
             actions[step] = action
@@ -227,18 +228,19 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(next_obs).reshape(1, -1) # critic's prediction
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
+            for t in reversed(range(args.num_steps)): # walking backwards through the rollout
+                if t == args.num_steps - 1: # last step reached
                     nextnonterminal = 1.0 - next_done
                     nextvalues = next_value
                 else:
                     nextnonterminal = 1.0 - dones[t + 1]
                     nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                # how much better or worse the immediate outcome was compared with what the critic predicted for the current state.
+                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t] # one step TD error; 
+                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam # ??
             returns = advantages + values
 
         # flatten the batch
@@ -252,9 +254,12 @@ if __name__ == "__main__":
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
+        # A complete pass over the rollout batch once, sliced into smaller minibatches
+        # why?
+        # sample efficiency!
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
+            for start in range(0, args.batch_size, args.minibatch_size): # 0, 512, 128
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
