@@ -80,9 +80,11 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 
 # ALGO LOGIC: initialize agent here:
+# critic part
 class SoftQNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
+        # it takes as an input state and action and outputs a single value Q(s,a)
         self.fc1 = nn.Linear(
             np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
             256,
@@ -91,6 +93,7 @@ class SoftQNetwork(nn.Module):
         self.fc3 = nn.Linear(256, 1)
 
     def forward(self, x, a):
+        # create a single vector with the action and state
         x = torch.cat([x, a], 1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
@@ -195,8 +198,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])
-
+    
     actor = Actor(envs).to(device)
+    # it might be the case that a Q value will be overstimated (a bit too much noise).
+    # That's why we compute two Q-networks to use min later on
     qf1 = SoftQNetwork(envs).to(device)
     qf2 = SoftQNetwork(envs).to(device)
     qf1_target = SoftQNetwork(envs).to(device)
@@ -207,6 +212,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
     # Automatic entropy tuning
+    # to balance the exporation
     if args.autotune:
         target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
@@ -227,6 +233,13 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
+    # the following loop looks as follow:
+    # 1.get state s_i
+    # 2. choose action a_i
+    # 3. Take the action and recieve next state s_{i+1} and reward r_i
+    # 4. store the experience in replay buffer (since it's off-policy)
+    # 5. Learn from past experiences
+    # get the observation (state s_0)
     obs, _ = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
@@ -237,6 +250,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             actions = actions.detach().cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
+        # taking the step in the env
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
@@ -253,6 +267,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         for idx, trunc in enumerate(truncations):
             if trunc:
                 real_next_obs[idx] = infos["final_observation"][idx]
+        # add the experience to the buffer
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
