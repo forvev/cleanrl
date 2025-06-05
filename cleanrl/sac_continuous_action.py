@@ -138,13 +138,18 @@ class Actor(nn.Module):
 
         return mean, log_std
 
+    # generate a stohastic action a~pi(a|s)
     def get_action(self, x):
+        # call the forward method
         mean, log_std = self(x)
         std = log_std.exp()
+        # unconstrained Gaussian policy
         normal = torch.distributions.Normal(mean, std)
-        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        y_t = torch.tanh(x_t)
+        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1)) TODO
+        y_t = torch.tanh(x_t) # bound the action space between -1 and 1
+        # rescale the action space
         action = y_t * self.action_scale + self.action_bias
+        # transform to log in order to deal with the xmall values of x_t
         log_prob = normal.log_prob(x_t)
         # Enforcing Action Bound
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
@@ -274,17 +279,24 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         obs = next_obs
 
         # ALGO LOGIC: training.
+        # start training at some specific timestamp
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
+                # the the action under the currect policy
                 next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
+                # compute two Q-functions to prevent the overstimation
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                 qf2_next_target = qf2_target(data.next_observations, next_state_actions)
+                # the value with less noise and combine it with the entropy
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
                 next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
             qf2_a_values = qf2(data.observations, data.actions).view(-1)
+            # compute the bellman error
+            # we want to minimize this!!!!!
+            # Bellman error — teaching the Q-functions to accurately estimate the value of actions
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
@@ -294,16 +306,20 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             qf_loss.backward()
             q_optimizer.step()
 
+            # the actor is updated every policy_frequency
             if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
                 for _ in range(
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
+                    # sample actions from the current policy
                     pi, log_pi, _ = actor.get_action(data.observations)
+                    # Q-values for the sampled actions
                     qf1_pi = qf1(data.observations, pi)
                     qf2_pi = qf2(data.observations, pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
+                    # backpropagation
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     actor_optimizer.step()
