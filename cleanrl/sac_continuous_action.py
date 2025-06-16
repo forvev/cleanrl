@@ -64,7 +64,8 @@ class Args:
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
 
-
+# gym.verctor.SyncVectorEnv expects a list of functions that each creatre a new enironment when called.
+# This is a common pattern in RL libraries to allow for parallel environments.
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
@@ -139,10 +140,10 @@ class Actor(nn.Module):
         return mean, log_std
 
     # generate a stohastic action a~pi(a|s)
-    def get_action(self, x):
-        # call the forward method
-        mean, log_std = self(x)
-        std = log_std.exp()
+    def get_action(self, s):
+        # call the forward method and get the mean and log standard deviation
+        mean, log_std = self(s)
+        std = log_std.exp() # exp to get the positive standard deviation
         # unconstrained Gaussian policy
         normal = torch.distributions.Normal(mean, std)
         x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1)) TODO
@@ -153,8 +154,8 @@ class Actor(nn.Module):
         log_prob = normal.log_prob(x_t)
         # Enforcing Action Bound
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
-        mean = torch.tanh(mean) * self.action_scale + self.action_bias
+        log_prob = log_prob.sum(1, keepdim=True) # sum over the action dimension
+        mean = torch.tanh(mean) * self.action_scale + self.action_bias # mean is also rescaled
         return action, log_prob, mean
 
 
@@ -283,7 +284,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
-                # the the action under the currect policy
+                # the action under the current policy
                 next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
                 # compute two Q-functions to prevent the overstimation
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
@@ -291,7 +292,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 # the value with less noise and combine it with the entropy
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
                 next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
+                # Q_target​=r+γ(1−d)⋅minQ(s′,a′)
 
+            # predict the Q-values for the actions taken in the current state
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
             qf2_a_values = qf2(data.observations, data.actions).view(-1)
             # compute the bellman error
@@ -327,7 +330,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     if args.autotune:
                         with torch.no_grad():
                             _, log_pi, _ = actor.get_action(data.observations)
-                        alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+                        alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean() # to maintain the right level
+                        # of randomness (exploration) in the actions
 
                         a_optimizer.zero_grad()
                         alpha_loss.backward()

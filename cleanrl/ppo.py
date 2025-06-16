@@ -47,7 +47,7 @@ class Args:
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.99 # just a discount variable
+    gamma: float = 0.99 # just a discount variable - 0.99 means that we should care about the future rewards
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
@@ -57,17 +57,17 @@ class Args:
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
-    clip_coef: float = 0.2
+    clip_coef: float = 0.2 # coef for determining how much the new policy can deviate from the old one
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
+    ent_coef: float = 0.01 # determines how much the agent should explore (the higher the value, the more exploration)
     """coefficient of the entropy"""
-    vf_coef: float = 0.5
+    vf_coef: float = 0.5 # coef for balaning the learning between the policy (actor) and the value (critic)
     """coefficient of the value function"""
-    max_grad_norm: float = 0.5
+    max_grad_norm: float = 0.5 # param for controling how much the gradients can change in a single update, improving the stability of the training
     """the maximum norm for the gradient clipping"""
-    target_kl: float = None
+    target_kl: float = None # is an optional safety check to keep policy updates from being too large.
     """the target KL divergence threshold"""
 
     # to be filled in runtime
@@ -119,8 +119,8 @@ class Agent(nn.Module):
     def get_value(self, x):
         return self.critic(x)
 
-    def get_action_and_value(self, x, action=None):
-        logits = self.actor(x) # actor outputs logits which are unnomalized action probabilities
+    def get_action_and_value(self, s, action=None):
+        logits = self.actor(s) # actor outputs logits which are unnomalized action probabilities
         # it means that they don't necessarily lie in <0,1> or sum up to 1
         # that's why we use Categorical which is basically a softmax operation to get the desired probability distribution
         probs = Categorical(logits=logits)
@@ -129,8 +129,8 @@ class Agent(nn.Module):
             action = probs.sample()
         # probs.log_prob(action) is basically log_{pi} (a_t|s_t). it answers: how confident was the policy in taking this action?”
         # probs.entropy() encourages exploration when high
-        # self.critic(x): still not sure how to explain this TODO
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+        # self.critic(x): estimate the value function for the current state
+        return action, probs.log_prob(action), probs.entropy(), self.critic(s)
 
 
 if __name__ == "__main__":
@@ -187,7 +187,7 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0 # to track the number of env step
     start_time = time.time() # will help to calculate FPS
-    next_obs, _ = envs.reset(seed=args.seed)
+    next_obs, _ = envs.reset(seed=args.seed) # init the envs and get the first observation to start interacting with them
     next_obs = torch.Tensor(next_obs).to(device) # stores the initial observation
     next_done = torch.zeros(args.num_envs).to(device) # As the rollout proceeds, this array is updated every step to reflect which environments have completed an episode.
 
@@ -197,8 +197,8 @@ if __name__ == "__main__":
         if args.anneal_lr:
             # because of args.num_iterations it will lineary decreace to zero. So at the beginning it will be doing kinda brave escapes,
             # however it will stop after some steps.
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
+            frac = 1.0 - (iteration - 1.0) / args.num_iterations # goes from 1 to 0
+            lrnow = frac * args.learning_rate # decreases the learning rate linearly
             optimizer.param_groups[0]["lr"] = lrnow
 
         for step in range(0, args.num_steps):
@@ -239,8 +239,11 @@ if __name__ == "__main__":
                     nextnonterminal = 1.0 - dones[t + 1]
                     nextvalues = values[t + 1]
                 # how much better or worse the immediate outcome was compared with what the critic predicted for the current state.
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t] # one step TD error; 
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam # ??
+                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t] # one step TD error; how much better
+                # or worse the outcome was compared to what the critic predicted for the current state.
+                #
+                # Generalized Advantage Estimation (GAE) is a way to compute advantages that reduces variance
+                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
         # flatten the batch
@@ -274,9 +277,12 @@ if __name__ == "__main__":
                     # On average, how surprised is the new policy when seeing actions from the old policy?
                     # there is a minus because it should be (-newlogprob + b_logprobs[mb_inds]) => old-new
                     old_approx_kl = (-logratio).mean() # approx_KL: E [-log(pi_new - pi_old)]
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    # tells us how often the policy tried to change too much
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+                    approx_kl = ((ratio - 1) - logratio).mean() # tells us how much the new policy differs from the old one
+                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()] # it tracks how ofter the PPO
+                    # clipping mechanism is triggered (true or false), helping to monitor if the policy updates are frequently
+                    # being limited by the clipping cooefficient.
+                    # A high clip fraction suggests that I may want to lower the learning rate or increase the clipping coefficient,
+                    # while a low clip fraction suggests that the policy updates are generally within the clipping range.
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
@@ -284,29 +290,32 @@ if __name__ == "__main__":
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 # Policy loss - this refers to the clipped objective
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss1 = -mb_advantages * ratio # standard policy gradient loss
+                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef) # clipped policy gradient loss
+                # which prevents the new policy from deviating too much from the old one
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean() # it does the max of negatives, however the paper
                 # does the min of positives, so it's equivalent
+                # pg_loss ensures that the policy update is not too large, which helps to stabilize training.
 
                 # Value loss - to avoid overfitting
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2 #MSE between the predicted and the actual returns
                     v_clipped = b_values[mb_inds] + torch.clamp(
                         newvalue - b_values[mb_inds],
                         -args.clip_coef,
                         args.clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                    ) # limits how much the new value prediction can change from the old one
+                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2 # MSE between the clipped value and the actual returns
+                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped) # ??
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 # Entropy loss
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef # combines the policy gradient loss,
+                # entropy bonus and value loss into a single scalar loss for optimization
 
                 # the learning part
                 optimizer.zero_grad() # clear out the gradients
